@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Anatomy Viewer — Always Outline</title>
+  <style>
+    html,body{margin:0;height:100%;background:#111;color:#ddd;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    #hud{position:fixed;top:10px;right:10px;display:flex;gap:8px;z-index:10;align-items:center}
+    .btn{background:#222;color:#ddd;border:1px solid #333;border-radius:6px;padding:8px 10px;font-size:14px;cursor:pointer}
+    .btn:active{transform:translateY(1px)}
+    #status{pointer-events:none;background:#0008;padding:6px 10px;border-radius:6px;font-size:12px;max-width:min(60ch,70vw)}
+    #canvas{width:100%;height:100%;display:block}
+  </style>
+  <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+  <script type="importmap">
+  {"imports":{
+    "three":"https://unpkg.com/three@0.161.0/build/three.module.js",
+    "three/addons/":"https://unpkg.com/three@0.161.0/examples/jsm/"
+  }}
+  </script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="hud">
+    <button id="reset" class="btn" title="Reset camera and selection">Reset</button>
+    <div id="status">Ready.</div>
+  </div>
+
+  <!-- Optional Base64 GLB embed. Leave empty unless embedding valid Base64. -->
+  <script id="embedded-glb" type="application/octet-stream"></script>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+  import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+  import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+  import { OutlinePass } from 'three/addons/postprocessing/OutlinePass.js';
+
+  // ---------- Config ----------
+  const GLB_URLS = [
+    'https://github.com/ken-odonnell/model-host/raw/refs/heads/main/Avatar.glb',
+    'https://raw.githubusercontent.com/ken-odonnell/model-host/main/Avatar.glb',
+    './assets/Avatar.glb','./Avatar.glb','./assets/avatar.glb','./avatar.glb'
+  ];
+  const BLOCK_LIST = new Set(['body']); // non-selectable
+  const IDLE_TIMEOUT_MS = 10000;        // 10s
+
+  // ---------- DOM ----------
+  const canvas = document.getElementById('canvas');
+  const statusEl = document.getElementById('status');
+  const resetBtn = document.getElementById('reset');
+  const setStatus = (m)=> statusEl.textContent = m;
+
+  // ---------- Three.js + post ----------
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.NoToneMapping;
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 10000);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true; controls.dampingFactor = 0.08; controls.zoomSpeed = 1.0; controls.rotateSpeed = 0.8; controls.panSpeed = 0.8;
+  controls.minDistance = 0.02; controls.maxDistance = 2000;
+
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const outlinePass = new OutlinePass(new THREE.Vector2(window.innerWidth, window.innerHeight), scene, camera, []);
+  outlinePass.edgeStrength = 6.0;      // thicker
+  outlinePass.edgeThickness = 3.0;     // thicker
+  outlinePass.edgeGlow = 0.0;
+  outlinePass.pulsePeriod = 0.0;
+  outlinePass.visibleEdgeColor.set(0x000000); // black
+  outlinePass.hiddenEdgeColor.set(0x111111);  // background color to hide back edges
+  composer.addPass(outlinePass);
+
+  let root = null; let meshes = []; let litSet = new Set(); let parts = new Map();
+  let bbox = new THREE.Box3(); let homeTarget = new THREE.Vector3(); let radius = 1;
+  let lastUser = performance.now();
+  const onUser = ()=>{ lastUser = performance.now(); };
+
+  function base64ToArrayBufferSafe(b64){ if(!b64) return null; const s=b64.replace(/\s+/g,''); if(!/^[A-Za-z0-9+/=]+$/.test(s) || s.length%4!==0) return null; try{ const bin=atob(s); const out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out.buffer; }catch{ return null; } }
+  function isBodyName(n){ return String(n||'').trim().toLowerCase()==='body'; }
+  function toUnlit(mat){ const make=(m)=>{ const x=new THREE.MeshBasicMaterial({map:m?.map??null,color:0xffffff,transparent:!!m?.transparent,opacity:typeof m?.opacity==='number'?m.opacity:1}); if(x.map){ x.map.colorSpace=THREE.SRGBColorSpace; x.map.needsUpdate=true; } return x; }; return Array.isArray(mat)?mat.map(make):make(mat||{}); }
+  function setMatColor(obj,hex){ if(Array.isArray(obj.material)){ for(const m of obj.material){ m.color.setHex(hex); m.needsUpdate=true; } } else { obj.material.color.setHex(hex); obj.material.needsUpdate=true; } }
+  function getTopPartName(o){ let cur=o, name=o.name||''; while(cur&&cur.parent&&cur.parent!==root){ if(cur.parent.name) name=cur.parent.name; cur=cur.parent; } return name||o.parent?.name||o.name||''; }
+  function collectMeshes(obj){ const list=[]; obj.traverse(n=>{ if(n.isMesh){ n.material=toUnlit(n.material); list.push(n);} }); return list; }
+
+  function applyDimming(){ const any=litSet.size>0; for(const m of meshes){ const part=getTopPartName(m); const lit = isBodyName(part) ? !any : (any?litSet.has(part):true); setMatColor(m, lit?0xffffff:0xbfbfbf);} }
+
+  function updateOutlineRoster(){ const sel=[]; for(const [name, rec] of parts){ if(BLOCK_LIST.has(name.toLowerCase())) continue; sel.push(...rec.meshes); } outlinePass.selectedObjects = sel; }
+
+  function groundSnapAndFrame(){
+    bbox.setFromObject(root); const minY=bbox.min.y; root.position.y -= minY; bbox.setFromObject(root);
+    const sphere=bbox.getBoundingSphere(new THREE.Sphere()); radius=Math.max(1e-3,sphere.radius);
+    const dist=radius*2.2; camera.position.set(sphere.center.x, sphere.center.y+radius*0.5, sphere.center.z+dist);
+    controls.target.set(sphere.center.x, sphere.center.y, sphere.center.z); homeTarget.copy(controls.target);
+    camera.near=Math.max(0.01,radius*0.01); camera.far=Math.max(1000,radius*50); camera.updateProjectionMatrix();
+    controls.minDistance=radius*0.05; controls.maxDistance=radius*50.0;
+  }
+
+  const gltfLoader = new GLTFLoader(); gltfLoader.setCrossOrigin('anonymous');
+  const loadFromArrayBuffer = (ab)=> new Promise((res,rej)=>gltfLoader.parse(ab,'',res,rej));
+  async function tryEmbedded(){ const tag=document.getElementById('embedded-glb'); const b64=tag?tag.textContent.trim():''; const ab=base64ToArrayBufferSafe(b64); if(!ab) return null; setStatus('Loading embedded GLB…'); try{ return await loadFromArrayBuffer(ab);}catch{return null;} }
+  async function tryURLs(urls){ for(const url of urls){ try{ setStatus(`Loading: ${url}`); return await gltfLoader.loadAsync(url);} catch(e){ console.warn('URL failed',url,e);} } return null; }
+
+  function clearModel(){ if(!root) return; scene.remove(root); root=null; meshes=[]; litSet.clear(); parts.clear(); }
+  function attachModel(gltf){
+    clearModel(); root=gltf.scene||gltf.scenes?.[0]; scene.add(root); meshes=collectMeshes(root);
+    // build parts map
+    parts.clear(); const top=root; const all=[]; root.traverse(o=>{ if(o.isMesh) all.push(o); });
+    for(const m of all){ let p=m; while(p.parent&&p.parent!==top) p=p.parent; const key=p.name||m.name||'Part'; if(!parts.has(key)) parts.set(key,{meshes:[]}); parts.get(key).meshes.push(m); }
+
+    const withMap = meshes.filter(m=> Array.isArray(m.material)? m.material.some(mm=>!!mm.map): !!m.material?.map).length;
+    setStatus(`Loaded. Meshes: ${meshes.length}. Textures: ${withMap} with maps, ${meshes.length-withMap} without.`);
+    groundSnapAndFrame(); applyDimming(); updateOutlineRoster(); onUser(); }
+
+  // ---------- Picking ----------
+  const raycaster=new THREE.Raycaster(); const ndc=new THREE.Vector2();
+  function pick(e){ const r=renderer.domElement.getBoundingClientRect(); const x=('touches'in e)?e.touches[0].clientX:e.clientX; const y=('touches'in e)?e.touches[0].clientY:e.clientY; ndc.x=((x-r.left)/r.width)*2-1; ndc.y=-((y-r.top)/r.height)*2+1; raycaster.setFromCamera(ndc,camera);
+    const hits=raycaster.intersectObjects(meshes,true); if(!hits.length) return; const part=getTopPartName(hits[0].object); if(BLOCK_LIST.has(part.toLowerCase())) return; if(litSet.has(part)) litSet.delete(part); else litSet.add(part); applyDimming(); setStatus(`Selected: ${[...litSet].join(', ')||'none'}`); }
+
+  // ---------- Reset ----------
+  function resetAll(){ litSet.clear(); applyDimming(); groundSnapAndFrame(); onUser(); }
+
+  // ---------- Events ----------
+  renderer.domElement.addEventListener('pointerdown', ()=>onUser(), {passive:true});
+  renderer.domElement.addEventListener('wheel', ()=>onUser(), {passive:true});
+  renderer.domElement.addEventListener('pointerup', (e)=>{ onUser(); pick(e); }, {passive:false});
+  renderer.domElement.addEventListener('touchend', ()=>onUser(), {passive:true});
+  resetBtn.addEventListener('click', resetAll);
+  window.addEventListener('resize', ()=>{ renderer.setSize(window.innerWidth,window.innerHeight); camera.aspect=window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); composer.setSize(window.innerWidth, window.innerHeight); outlinePass.resolution.set(window.innerWidth, window.innerHeight); });
+
+  // ---------- Animate ----------
+  function animate(){ requestAnimationFrame(animate);
+    if(root && (performance.now()-lastUser)>IDLE_TIMEOUT_MS){ const a=1-Math.pow(1-0.4, 1/60); controls.target.lerp(homeTarget,a); }
+    controls.update(); composer.render();
+  } animate();
+
+  // ---------- Boot ----------
+  (async function boot(){ try{ let gltf=await tryEmbedded(); if(!gltf) gltf=await tryURLs(GLB_URLS); if(gltf) attachModel(gltf); else { setStatus('No model loaded.'); root=new THREE.Group(); scene.add(root);} } catch(e){ console.error(e); setStatus('Load error.'); }})();
+
+  // ---------- Tests ----------
+  (function tests(){ console.log('%c[TEST] start','color:#0f0'); console.assert(BLOCK_LIST.has('body'),'Body blocked'); console.assert(typeof OutlinePass!=='undefined','OutlinePass present'); console.log('%c[TEST] end','color:#0f0'); })();
+
+  </script>
+</body>
+</html>
